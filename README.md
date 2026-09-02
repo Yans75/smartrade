@@ -170,55 +170,27 @@ lignes. Le schéma complet est dans `supabase/migrations/`.
 
 ## Mise en route
 
-### 1. Créer votre propre projet Supabase
+**Guide complet pas à pas : [SETUP.md](SETUP.md)** — création du projet
+Supabase, schéma SQL en un copier-coller, clés, configuration de l'auth,
+droits admin et déploiement, avec les pièges courants.
 
-Sur [supabase.com](https://supabase.com), nouveau projet (plan gratuit
-suffisant pour démarrer). Récupérez dans *Project Settings > API* :
-`SUPABASE_URL` et la clé publishable.
-
-Appliquez le schéma : dans l'éditeur SQL du projet, exécutez dans l'ordre
-les fichiers de `supabase/migrations/` (ils sont numérotés
-chronologiquement).
-
-Pour la connexion Google (optionnelle) : *Authentication > Providers >
-Google*, avec vos propres identifiants OAuth Google Cloud.
-
-### 2. Créer une clé DeepSeek
-
-Sur [platform.deepseek.com](https://platform.deepseek.com), générez une clé
-API. Notez l'id exact du modèle que vous voulez utiliser depuis la
-documentation ou le tableau de bord DeepSeek.
-
-### 3. Variables d'environnement
+En résumé :
 
 ```bash
-cp .env.example .env
-# puis remplissez SUPABASE_*, VITE_SUPABASE_*, DEEPSEEK_API_KEY, DEEPSEEK_MODEL
-```
-
-### 4. Développement
-
-```bash
+cp .env.example .env    # puis remplir les clés Supabase + DeepSeek
 bun install
-bun run dev        # http://localhost:8080
+bun run dev             # http://localhost:8080
 bun run lint
-bun run format
 bun run build
 ```
 
-### 5. Hébergement
+Le schéma de base de données s'applique en une fois depuis
+[`supabase/schema.sql`](supabase/schema.sql) (SQL Editor du dashboard
+Supabase). Le dossier `supabase/migrations/` ne garde que l'historique.
 
-Le build cible Cloudflare Workers par défaut (`nitro({ preset:
-"cloudflare-module" })` dans `vite.config.ts`) :
-
-```bash
-bun run build
-npx wrangler deploy --prebuilt
-```
-
-Nécessite un compte Cloudflare (plan gratuit suffisant pour démarrer) et les
-variables d'environnement configurées côté Worker (Supabase + DeepSeek,
-mêmes noms que `.env`).
+Le build cible Cloudflare Workers (`nitro({ preset: "cloudflare-module" })`
+dans `vite.config.ts`) : `bun run build && npx wrangler deploy --prebuilt`,
+avec les mêmes variables d'environnement côté Worker.
 
 ---
 
