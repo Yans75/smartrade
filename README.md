@@ -76,16 +76,18 @@ Le signal est ensuite écrit dans `signals` et le quota incrémenté.
 
 `src/lib/ai-gateway.server.ts` appelle l'API DeepSeek directement (elle est
 compatible OpenAI, d'où le même client `@ai-sdk/openai-compatible` déjà
-utilisé). Deux variables sont obligatoires :
+utilisé). Base URL confirmée depuis la page officielle *Models & Pricing* de
+DeepSeek : `https://api.deepseek.com` (sans `/v1` — le client n'ajoute que
+`/chat/completions`).
 
 - `DEEPSEEK_API_KEY` — votre clé, depuis platform.deepseek.com
-- `DEEPSEEK_MODEL` — l'id exact du modèle à utiliser. **Il n'y a pas de
-  valeur par défaut codée en dur** : confirmez l'id exact du modèle que vous
-  voulez tester (le nom commercial « DeepSeek V4-Pro » ne correspond pas
-  forcément à l'id d'API attendu par le SDK) dans votre tableau de bord
-  DeepSeek avant de le renseigner. Sans ces deux variables, la génération de
-  signal échoue avec un message explicite plutôt que d'appeler un mauvais
-  modèle.
+- `DEEPSEEK_MODEL` — id du modèle. Défaut : `deepseek-v4-pro` (id confirmé
+  sur la page *Models & Pricing* de DeepSeek — support JSON Output et Tool
+  Calls vérifié, ce dont dépend la sortie structurée du signal). Modifiable
+  pour tester une autre variante, par exemple `deepseek-v4-flash`.
+
+Sans `DEEPSEEK_API_KEY`, la génération de signal échoue avec un message
+explicite plutôt que d'appeler l'API sans authentification.
 
 ---
 

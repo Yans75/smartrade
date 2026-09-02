@@ -4,11 +4,16 @@ import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
  * DeepSeek's API is OpenAI-compatible, so the same @ai-sdk/openai-compatible
  * client used for the previous provider works unchanged — only the base URL,
  * auth header and model id change.
+ *
+ * Base URL confirmed against DeepSeek's own "Models & Pricing" page
+ * (api-docs.deepseek.com/quick_start/pricing): "https://api.deepseek.com",
+ * no /v1 suffix — the OpenAI-compatible client appends /chat/completions
+ * itself, it does not add /v1.
  */
 export function createDeepSeekProvider(apiKey: string) {
   return createOpenAICompatible({
     name: "deepseek",
-    baseURL: "https://api.deepseek.com/v1",
+    baseURL: "https://api.deepseek.com",
     supportsStructuredOutputs: true,
     headers: {
       Authorization: `Bearer ${apiKey}`,
@@ -17,10 +22,8 @@ export function createDeepSeekProvider(apiKey: string) {
 }
 
 /**
- * No verified model id for "DeepSeek V4-Pro" was available when this was
- * wired up, so there is no hardcoded default: set DEEPSEEK_MODEL in .env to
- * the exact id from your DeepSeek dashboard/docs (e.g. "deepseek-chat" or
- * "deepseek-reasoner" are the ids documented as of early 2026 — confirm
- * against your account before relying on it).
+ * "deepseek-v4-pro" — confirmed against DeepSeek's Models & Pricing page.
+ * JSON Output and Tool Calls are both supported on this model, which is what
+ * the structured signal output (Output.object) relies on.
  */
-export const SIGNAL_MODEL = process.env["DEEPSEEK_MODEL"] ?? "";
+export const SIGNAL_MODEL = process.env["DEEPSEEK_MODEL"] ?? "deepseek-v4-pro";
