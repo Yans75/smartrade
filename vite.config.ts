@@ -41,7 +41,11 @@ export default defineViteConfig(({ command, mode }) => {
         ],
         ignoreOutdatedRequests: true,
       },
-      server: { host: "::", port: 8080 },
+      // Pas de host "::" (hérité du sandbox Lovable) : l'IPv6 n'est pas
+      // disponible partout et l'échec est illisible. Vite écoute sur
+      // localhost par défaut ; `--host` en ligne de commande si besoin
+      // d'exposer le serveur de dev sur le réseau local.
+      server: { port: 8080 },
       plugins: [
         tailwindcss(),
         tsConfigPaths({ projects: ["./tsconfig.json"] }),
