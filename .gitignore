@@ -10,6 +10,12 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
+
+# Le projet suit bun.lock. package-lock.json est régénéré à chaque install
+# (npm ci avec un lockfile figé s'est révélé peu fiable pour la dépendance
+# optionnelle native de rolldown selon la plateforme — bug npm connu,
+# https://github.com/npm/cli/issues/4828).
+package-lock.json
 .output
 .vinxi
 .tanstack/**

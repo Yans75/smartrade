@@ -17,7 +17,14 @@ jobs:
         with:
           node-version: 22
 
-      - run: npm ci
+      # npm ci avec un lockfile figé s'est révélé peu fiable pour la
+      # dépendance native optionnelle de rolldown (bug npm connu :
+      # https://github.com/npm/cli/issues/4828). npm install la résout
+      # fraîchement à chaque run ; le force-install ci-dessous est un
+      # filet de sécurité si l'auto-détection de plateforme se trompe
+      # quand même (musl au lieu de gnu, observé une fois en test).
+      - run: npm install
+      - run: npm install --no-save @rolldown/binding-linux-x64-gnu
 
       # Les variables VITE_* sont lues au build (elles finissent dans le
       # bundle client) — le reste est lu au runtime par le Worker.
