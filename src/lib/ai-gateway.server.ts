@@ -75,4 +75,12 @@ export function createDeepSeekProvider(apiKey: string) {
 export const SIGNAL_MODEL = process.env["DEEPSEEK_MODEL"] ?? "deepseek-v4-pro";
 
 /** Plafond de temps sur l'appel au modèle, en millisecondes. */
-export const SIGNAL_TIMEOUT_MS = Number(process.env["DEEPSEEK_TIMEOUT_MS"] ?? 25_000);
+export const SIGNAL_TIMEOUT_MS = Number(process.env["DEEPSEEK_TIMEOUT_MS"] ?? 60_000);
+
+/**
+ * Budget de tokens de sortie. En mode thinking, le raisonnement se consomme
+ * sur ce budget : trop bas, le modèle raisonne jusqu'à épuisement et renvoie
+ * un contenu vide. Une fois le thinking coupé (DEEPSEEK_EXTRA_BODY), 800
+ * suffisent largement pour le signal seul.
+ */
+export const SIGNAL_MAX_TOKENS = Number(process.env["DEEPSEEK_MAX_TOKENS"] ?? 4_000);

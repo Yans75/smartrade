@@ -1,6 +1,11 @@
 import { generateText } from "ai";
 import { z } from "zod";
-import { createDeepSeekProvider, SIGNAL_MODEL, SIGNAL_TIMEOUT_MS } from "@/lib/ai-gateway.server";
+import {
+  createDeepSeekProvider,
+  SIGNAL_MAX_TOKENS,
+  SIGNAL_MODEL,
+  SIGNAL_TIMEOUT_MS,
+} from "@/lib/ai-gateway.server";
 import { fetchCandles, fetchDepth, fetchQuotes } from "@/lib/market/market.server";
 import { TIMEFRAMES, roundTo, type Timeframe } from "@/lib/market/symbols";
 import { analyseStructure, type StructureAnalysis } from "./analysis.server";
@@ -168,14 +173,19 @@ export async function generateAiSignal(symbol: string, mode: TradingMode): Promi
     const result = await generateText({
       model: gateway(SIGNAL_MODEL),
       prompt,
-      // Borne la génération : le signal tient largement dans cette limite, et
-      // un modèle qui partirait en digression ne fait plus attendre pour rien.
-      maxOutputTokens: 700,
+      // En mode thinking, les tokens de raisonnement se consomment sur ce même
+      // budget : une limite trop basse (700 a été essayé) épuise le budget en
+      // raisonnement et renvoie un contenu VIDE, sans erreur. D'où une marge
+      // large ici — c'est le mode thinking qu'il faut couper pour gagner du
+      // temps, pas le budget de sortie.
+      maxOutputTokens: SIGNAL_MAX_TOKENS,
       // Plafond dur : au-delà, mieux vaut une erreur nette qu'un utilisateur
       // qui regarde un bouton tourner pendant plusieurs minutes.
       abortSignal: AbortSignal.timeout(SIGNAL_TIMEOUT_MS),
     });
-    raw = result.text;
+    // Les modèles à raisonnement peuvent placer leur sortie dans le champ de
+    // raisonnement et laisser le contenu vide : on regarde les deux.
+    raw = result.text?.trim() ? result.text : (result.reasoningText ?? "");
   } catch (error) {
     const elapsed = Math.round((Date.now() - llmStartedAt) / 1000);
     if (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")) {
