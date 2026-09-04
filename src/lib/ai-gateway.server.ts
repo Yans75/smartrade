@@ -9,12 +9,20 @@ import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
  * (api-docs.deepseek.com/quick_start/pricing): "https://api.deepseek.com",
  * no /v1 suffix — the OpenAI-compatible client appends /chat/completions
  * itself, it does not add /v1.
+ *
+ * supportsStructuredOutputs must stay false: set to true it makes the SDK
+ * send OpenAI's strict `response_format: {type: "json_schema", ...}`, which
+ * DeepSeek rejected in production with "This response_format type is
+ * unavailable now". DeepSeek's own docs list "Json Output" support (the
+ * older `json_object` mode) and "Tool Calls", not the strict json_schema
+ * mode — with this false, the AI SDK falls back to tool-calling to get the
+ * structured signal object, which DeepSeek does support.
  */
 export function createDeepSeekProvider(apiKey: string) {
   return createOpenAICompatible({
     name: "deepseek",
     baseURL: "https://api.deepseek.com",
-    supportsStructuredOutputs: true,
+    supportsStructuredOutputs: false,
     headers: {
       Authorization: `Bearer ${apiKey}`,
     },
