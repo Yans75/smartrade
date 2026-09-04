@@ -112,6 +112,10 @@ export async function generateAiSignal(symbol: string, mode: TradingMode): Promi
     `Le stop et les TP doivent être cohérents avec la direction (pour un BUY : stop < entrée < TP1 < TP2 < TP3).`,
     `confidence_score : entier 0-100. Tous les textes en français, 3 à 6 phrases pour reasoning.`,
     `Si aucune configuration n'est valable, renvoie direction NEUTRAL avec une confiance faible.`,
+    // DeepSeek (comme l'API OpenAI qu'il imite) exige que le prompt
+    // mentionne explicitement "JSON" pour accepter response_format:
+    // {type: "json_object"} — sinon il renvoie une erreur 400.
+    `Réponds uniquement avec un objet JSON valide respectant exactement le schéma demandé, sans texte hors JSON.`,
   ].join("\n");
 
   let output: z.infer<typeof AiSignal>;
