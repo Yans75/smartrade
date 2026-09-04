@@ -127,8 +127,15 @@ export async function generateAiSignal(symbol: string, mode: TradingMode): Promi
     });
     output = result.output;
   } catch (error) {
-    if (NoObjectGeneratedError.isInstance(error))
+    if (NoObjectGeneratedError.isInstance(error)) {
+      // Sortie brute du modèle : seul moyen de voir pourquoi le parsing a
+      // échoué (markdown autour du JSON, champ manquant, enum invalide...).
+      // Visible dans les logs du Worker (Cloudflare dashboard > Workers >
+      // smartrade > Logs), pas renvoyé au client.
+      console.error("[DeepSeek] NoObjectGeneratedError — texte brut reçu:", error.text);
+      console.error("[DeepSeek] cause:", error.cause);
       throw new AiGatewayError("L'IA n'a pas renvoyé une analyse exploitable. Réessayez.", 502);
+    }
     const status = statusOf(error) ?? 500;
     throw new AiGatewayError(messageFor(status, (error as Error).message), status);
   }
