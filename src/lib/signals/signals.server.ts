@@ -1,9 +1,10 @@
-import { generateText, Output, NoObjectGeneratedError } from "ai";
+import { generateText } from "ai";
 import { z } from "zod";
 import { createDeepSeekProvider, SIGNAL_MODEL } from "@/lib/ai-gateway.server";
 import { fetchCandles, fetchDepth, fetchQuotes } from "@/lib/market/market.server";
 import { TIMEFRAMES, roundTo, type Timeframe } from "@/lib/market/symbols";
 import { analyseStructure, type StructureAnalysis } from "./analysis.server";
+import { extractJsonObject } from "./extract-json";
 import { checkLevels } from "./validate";
 import type { TradingMode, TradingSignal } from "@/lib/mock/types";
 
@@ -43,6 +44,22 @@ export class AiGatewayError extends Error {
   ) {
     super(message);
   }
+}
+
+/** Extraction tolérante : renvoie null plutôt que de jeter, safeParse gère la suite. */
+function safeExtract(raw: string): unknown {
+  try {
+    return extractJsonObject(raw);
+  } catch {
+    return null;
+  }
+}
+
+/** Extrait court de la réponse du modèle, pour un message d'erreur lisible. */
+function preview(raw: string): string {
+  const clean = raw.replace(/\s+/g, " ").trim();
+  if (clean.length === 0) return "(réponse vide)";
+  return clean.length > 300 ? `${clean.slice(0, 300)}…` : clean;
 }
 
 function statusOf(error: unknown): number | null {
@@ -112,33 +129,55 @@ export async function generateAiSignal(symbol: string, mode: TradingMode): Promi
     `Le stop et les TP doivent être cohérents avec la direction (pour un BUY : stop < entrée < TP1 < TP2 < TP3).`,
     `confidence_score : entier 0-100. Tous les textes en français, 3 à 6 phrases pour reasoning.`,
     `Si aucune configuration n'est valable, renvoie direction NEUTRAL avec une confiance faible.`,
-    // DeepSeek (comme l'API OpenAI qu'il imite) exige que le prompt
-    // mentionne explicitement "JSON" pour accepter response_format:
-    // {type: "json_object"} — sinon il renvoie une erreur 400.
-    `Réponds uniquement avec un objet JSON valide respectant exactement le schéma demandé, sans texte hors JSON.`,
+    ``,
+    // Le schéma est décrit ici en toutes lettres : sans Output.object(), le
+    // SDK n'injecte plus de description de schéma, c'est ce bloc qui porte
+    // le contrat.
+    `Réponds UNIQUEMENT par un objet JSON, sans texte autour, sans balise markdown, avec exactement ces clés :`,
+    `{`,
+    `  "direction": "BUY" | "SELL" | "NEUTRAL",`,
+    `  "entry_price": nombre,`,
+    `  "stop_loss": nombre,`,
+    `  "take_profit_1": nombre,`,
+    `  "take_profit_2": nombre,`,
+    `  "take_profit_3": nombre,`,
+    `  "confidence_score": entier 0-100,`,
+    `  "reasoning": "3 à 6 phrases en français",`,
+    `  "position_advice": "conseil de gestion de position en français",`,
+    `  "market_warning": "avertissement en français" ou null,`,
+    `  "order_flow_confirms": true | false,`,
+    `  "order_flow_strength": "fort" | "moyen" | "faible",`,
+    `  "order_flow_observation": "observation en français"`,
+    `}`,
   ].join("\n");
 
-  let output: z.infer<typeof AiSignal>;
+  // Pas d'Output.object() : la négociation de sortie structurée du SDK avec
+  // DeepSeek a échoué de trois façons successives en production (json_schema
+  // refusé, puis json_object exigeant le mot "json", puis parsing impossible).
+  // deepseek-v4-pro tourne en mode "thinking" par défaut et entoure son JSON
+  // de raisonnement, ce qu'aucun parseur strict n'accepte. On récupère donc le
+  // texte brut et on extrait/valide nous-mêmes.
+  let raw: string;
   try {
-    const result = await generateText({
-      model: gateway(SIGNAL_MODEL),
-      output: Output.object({ schema: AiSignal }),
-      prompt,
-    });
-    output = result.output;
+    const result = await generateText({ model: gateway(SIGNAL_MODEL), prompt });
+    raw = result.text;
   } catch (error) {
-    if (NoObjectGeneratedError.isInstance(error)) {
-      // Sortie brute du modèle : seul moyen de voir pourquoi le parsing a
-      // échoué (markdown autour du JSON, champ manquant, enum invalide...).
-      // Visible dans les logs du Worker (Cloudflare dashboard > Workers >
-      // smartrade > Logs), pas renvoyé au client.
-      console.error("[DeepSeek] NoObjectGeneratedError — texte brut reçu:", error.text);
-      console.error("[DeepSeek] cause:", error.cause);
-      throw new AiGatewayError("L'IA n'a pas renvoyé une analyse exploitable. Réessayez.", 502);
-    }
     const status = statusOf(error) ?? 500;
     throw new AiGatewayError(messageFor(status, (error as Error).message), status);
   }
+
+  const parsed = AiSignal.safeParse(safeExtract(raw));
+  if (!parsed.success) {
+    console.error("[DeepSeek] réponse non conforme. Texte brut:", raw);
+    console.error("[DeepSeek] erreurs de validation:", parsed.error.issues);
+    // L'extrait est renvoyé au client : sans accès aux logs du Worker, c'est
+    // le seul moyen de diagnostiquer un échec depuis l'interface.
+    throw new AiGatewayError(
+      `L'IA n'a pas renvoyé une analyse exploitable. Réponse reçue : ${preview(raw)}`,
+      502,
+    );
+  }
+  const output = parsed.data;
 
   const ref = quote.price;
 
