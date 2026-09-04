@@ -1,6 +1,6 @@
 import { generateText } from "ai";
 import { z } from "zod";
-import { createDeepSeekProvider, SIGNAL_MODEL } from "@/lib/ai-gateway.server";
+import { createDeepSeekProvider, SIGNAL_MODEL, SIGNAL_TIMEOUT_MS } from "@/lib/ai-gateway.server";
 import { fetchCandles, fetchDepth, fetchQuotes } from "@/lib/market/market.server";
 import { TIMEFRAMES, roundTo, type Timeframe } from "@/lib/market/symbols";
 import { analyseStructure, type StructureAnalysis } from "./analysis.server";
@@ -89,11 +89,16 @@ export async function generateAiSignal(symbol: string, mode: TradingMode): Promi
       401,
     );
 
+  const startedAt = Date.now();
+
+  // 80 bougies suffisent à tout ce que calcule analyseStructure (SMA50, ATR14,
+  // swings) : 150 allongeaient la collecte sans rien changer à l'analyse.
   const [quotes, depth, ...candleSets] = await Promise.all([
     fetchQuotes([symbol]),
     fetchDepth(symbol).catch(() => null),
-    ...TIMEFRAMES.map((tf) => fetchCandles(symbol, tf, 150)),
+    ...TIMEFRAMES.map((tf) => fetchCandles(symbol, tf, 80)),
   ]);
+  const marketMs = Date.now() - startedAt;
 
   const quote = quotes[0];
   if (!quote?.price) throw new AiGatewayError(`Aucune donnée de marché pour ${symbol}.`, 400);
@@ -127,13 +132,13 @@ export async function generateAiSignal(symbol: string, mode: TradingMode): Promi
     ``,
     `Donne un signal exploitable : entrée réaliste proche du prix actuel, stop loss placé derrière un niveau invalidant la structure, et 3 take profits croissants en R:R (au moins 1.2R, 2R, 3R).`,
     `Le stop et les TP doivent être cohérents avec la direction (pour un BUY : stop < entrée < TP1 < TP2 < TP3).`,
-    `confidence_score : entier 0-100. Tous les textes en français, 3 à 6 phrases pour reasoning.`,
     `Si aucune configuration n'est valable, renvoie direction NEUTRAL avec une confiance faible.`,
     ``,
     // Le schéma est décrit ici en toutes lettres : sans Output.object(), le
     // SDK n'injecte plus de description de schéma, c'est ce bloc qui porte
-    // le contrat.
-    `Réponds UNIQUEMENT par un objet JSON, sans texte autour, sans balise markdown, avec exactement ces clés :`,
+    // le contrat. Les textes sont volontairement courts : chaque phrase
+    // générée en plus, c'est de la latence en plus pour l'utilisateur.
+    `Va droit au but, sans raisonnement affiché. Réponds UNIQUEMENT par un objet JSON, sans texte autour, sans balise markdown, avec exactement ces clés :`,
     `{`,
     `  "direction": "BUY" | "SELL" | "NEUTRAL",`,
     `  "entry_price": nombre,`,
@@ -142,12 +147,12 @@ export async function generateAiSignal(symbol: string, mode: TradingMode): Promi
     `  "take_profit_2": nombre,`,
     `  "take_profit_3": nombre,`,
     `  "confidence_score": entier 0-100,`,
-    `  "reasoning": "3 à 6 phrases en français",`,
-    `  "position_advice": "conseil de gestion de position en français",`,
-    `  "market_warning": "avertissement en français" ou null,`,
+    `  "reasoning": "2 phrases maximum, en français",`,
+    `  "position_advice": "1 phrase, en français",`,
+    `  "market_warning": "1 phrase, en français" ou null,`,
     `  "order_flow_confirms": true | false,`,
     `  "order_flow_strength": "fort" | "moyen" | "faible",`,
-    `  "order_flow_observation": "observation en français"`,
+    `  "order_flow_observation": "1 phrase, en français"`,
     `}`,
   ].join("\n");
 
@@ -157,14 +162,36 @@ export async function generateAiSignal(symbol: string, mode: TradingMode): Promi
   // deepseek-v4-pro tourne en mode "thinking" par défaut et entoure son JSON
   // de raisonnement, ce qu'aucun parseur strict n'accepte. On récupère donc le
   // texte brut et on extrait/valide nous-mêmes.
+  const llmStartedAt = Date.now();
   let raw: string;
   try {
-    const result = await generateText({ model: gateway(SIGNAL_MODEL), prompt });
+    const result = await generateText({
+      model: gateway(SIGNAL_MODEL),
+      prompt,
+      // Borne la génération : le signal tient largement dans cette limite, et
+      // un modèle qui partirait en digression ne fait plus attendre pour rien.
+      maxOutputTokens: 700,
+      // Plafond dur : au-delà, mieux vaut une erreur nette qu'un utilisateur
+      // qui regarde un bouton tourner pendant plusieurs minutes.
+      abortSignal: AbortSignal.timeout(SIGNAL_TIMEOUT_MS),
+    });
     raw = result.text;
   } catch (error) {
+    const elapsed = Math.round((Date.now() - llmStartedAt) / 1000);
+    if (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")) {
+      console.error(`[DeepSeek] délai dépassé après ${elapsed}s (modèle ${SIGNAL_MODEL})`);
+      throw new AiGatewayError(
+        `Le modèle ${SIGNAL_MODEL} n'a pas répondu en moins de ${Math.round(SIGNAL_TIMEOUT_MS / 1000)}s. Réessayez, ou passez sur un modèle plus rapide.`,
+        504,
+      );
+    }
     const status = statusOf(error) ?? 500;
     throw new AiGatewayError(messageFor(status, (error as Error).message), status);
   }
+  const llmMs = Date.now() - llmStartedAt;
+  console.log(
+    `[Smartrade] ${symbol} ${mode} — marché ${marketMs}ms, modèle ${llmMs}ms (${SIGNAL_MODEL}), total ${Date.now() - startedAt}ms`,
+  );
 
   const parsed = AiSignal.safeParse(safeExtract(raw));
   if (!parsed.success) {

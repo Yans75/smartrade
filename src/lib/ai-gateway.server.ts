@@ -1,22 +1,58 @@
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 
 /**
- * DeepSeek's API is OpenAI-compatible, so the same @ai-sdk/openai-compatible
- * client used for the previous provider works unchanged — only the base URL,
- * auth header and model id change.
+ * Paramètres supplémentaires fusionnés dans le corps de chaque requête, lus
+ * depuis DEEPSEEK_EXTRA_BODY (JSON).
  *
- * Base URL confirmed against DeepSeek's own "Models & Pricing" page
- * (api-docs.deepseek.com/quick_start/pricing): "https://api.deepseek.com",
- * no /v1 suffix — the OpenAI-compatible client appends /chat/completions
- * itself, it does not add /v1.
+ * Sert surtout à couper le mode "thinking" : deepseek-v4-pro raisonne par
+ * défaut, ce qui fait passer une génération de ~15 s à plusieurs minutes. La
+ * convention exacte du paramètre n'est pas vérifiable depuis cet environnement
+ * (réseau bloqué vers la doc DeepSeek), donc elle est configurable plutôt que
+ * codée en dur — on peut tester une convention sans redéployer, en changeant
+ * seulement le secret.
  *
- * supportsStructuredOutputs must stay false: set to true it makes the SDK
- * send OpenAI's strict `response_format: {type: "json_schema", ...}`, which
- * DeepSeek rejected in production with "This response_format type is
- * unavailable now". DeepSeek's own docs list "Json Output" support (the
- * older `json_object` mode) and "Tool Calls", not the strict json_schema
- * mode — with this false, the AI SDK falls back to tool-calling to get the
- * structured signal object, which DeepSeek does support.
+ * Exemples de valeurs à essayer :
+ *   {"chat_template_kwargs":{"thinking":false}}
+ *   {"thinking":{"type":"disabled"}}
+ *   {"reasoning_effort":"minimal"}
+ */
+function extraBody(): Record<string, unknown> {
+  const raw = process.env["DEEPSEEK_EXTRA_BODY"];
+  if (!raw) return {};
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return parsed !== null && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    console.error("[DeepSeek] DEEPSEEK_EXTRA_BODY n'est pas du JSON valide, ignoré:", raw);
+    return {};
+  }
+}
+
+/** Injecte les paramètres additionnels dans le corps JSON sortant. */
+function fetchWithExtraBody(extra: Record<string, unknown>): typeof fetch {
+  if (Object.keys(extra).length === 0) return fetch;
+  return async (input, init) => {
+    if (typeof init?.body !== "string") return fetch(input, init);
+    try {
+      const body = JSON.parse(init.body) as Record<string, unknown>;
+      return fetch(input, { ...init, body: JSON.stringify({ ...body, ...extra }) });
+    } catch {
+      return fetch(input, init);
+    }
+  };
+}
+
+/**
+ * L'API DeepSeek est compatible OpenAI, d'où le même client
+ * @ai-sdk/openai-compatible.
+ *
+ * Base URL confirmée sur la page officielle "Models & Pricing" de DeepSeek :
+ * "https://api.deepseek.com", sans suffixe /v1.
+ *
+ * supportsStructuredOutputs reste à false : à true, le SDK envoie le mode
+ * strict json_schema d'OpenAI, refusé en production par DeepSeek. De toute
+ * façon le parsing du JSON est fait à la main (voir extract-json.ts), donc
+ * plus aucune négociation de format n'a lieu.
  */
 export function createDeepSeekProvider(apiKey: string) {
   return createOpenAICompatible({
@@ -26,12 +62,17 @@ export function createDeepSeekProvider(apiKey: string) {
     headers: {
       Authorization: `Bearer ${apiKey}`,
     },
+    fetch: fetchWithExtraBody(extraBody()),
   });
 }
 
 /**
- * "deepseek-v4-pro" — confirmed against DeepSeek's Models & Pricing page.
- * JSON Output and Tool Calls are both supported on this model, which is what
- * the structured signal output (Output.object) relies on.
+ * "deepseek-v4-pro" par défaut — id confirmé sur la page Models & Pricing.
+ * "deepseek-v4-flash" est nettement plus rapide et 3x moins cher : c'est la
+ * première chose à essayer si la latence pose problème (changer le secret
+ * DEEPSEEK_MODEL, aucun redéploiement de code nécessaire).
  */
 export const SIGNAL_MODEL = process.env["DEEPSEEK_MODEL"] ?? "deepseek-v4-pro";
+
+/** Plafond de temps sur l'appel au modèle, en millisecondes. */
+export const SIGNAL_TIMEOUT_MS = Number(process.env["DEEPSEEK_TIMEOUT_MS"] ?? 25_000);
