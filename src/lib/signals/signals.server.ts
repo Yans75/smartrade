@@ -1,45 +1,33 @@
-import { generateText } from "ai";
-import { z } from "zod";
-import {
-  createDeepSeekProvider,
-  SIGNAL_MAX_TOKENS,
-  SIGNAL_MODEL,
-  SIGNAL_TIMEOUT_MS,
-} from "@/lib/ai-gateway.server";
+import { JEV_MODEL, JevError, systemOne } from "@/lib/jev/client.server";
 import { fetchCandles, fetchDepth, fetchQuotes } from "@/lib/market/market.server";
-import { TIMEFRAMES, roundTo, type Timeframe } from "@/lib/market/symbols";
+import { TIMEFRAMES, type Timeframe } from "@/lib/market/symbols";
 import { analyseStructure, type StructureAnalysis } from "./analysis.server";
-import { extractJsonObject } from "./extract-json";
-import { checkLevels } from "./validate";
+import { buildSignal, decide } from "./build-signal";
+import { logJevCall } from "./jev-log.server";
+import { signalQuestions } from "./jev-questions";
+import { buildSignalState } from "./jev-state";
 import type { TradingMode, TradingSignal } from "@/lib/mock/types";
 
-const AiSignal = z.object({
-  direction: z.enum(["BUY", "SELL", "NEUTRAL"]),
-  entry_price: z.number(),
-  stop_loss: z.number(),
-  take_profit_1: z.number(),
-  take_profit_2: z.number(),
-  take_profit_3: z.number(),
-  confidence_score: z.number(),
-  reasoning: z.string(),
-  position_advice: z.string(),
-  market_warning: z.string().nullable(),
-  order_flow_confirms: z.boolean(),
-  order_flow_strength: z.enum(["fort", "moyen", "faible"]),
-  order_flow_observation: z.string(),
-});
+/**
+ * Génération d'un signal par le moteur Jev (TypeSafe AI).
+ *
+ * Le pipeline tient en quatre étapes, toutes bornées en temps :
+ *   1. collecte des données de marché (parallélisée)
+ *   2. analyse de structure déterministe (locale, instantanée)
+ *   3. UN appel à Jev qui répond aux trois questions de décision
+ *   4. construction du signal, niveaux calculés depuis l'ATR
+ *
+ * Jev est un modèle « System One » : il ne déroule pas de chaîne de
+ * raisonnement, il renvoie des probabilités. C'est ce qui permet de tenir un
+ * budget de latence — l'approche LLM génératif précédente demandait au modèle
+ * de rédiger son analyse, et le raisonnement à lui seul dépassait la minute.
+ */
 
-/** Mirrors SL_ATR in validate.ts, for the message shown to the user. */
-const SL_ATR_LABEL: Record<TradingMode, string> = {
-  scalping: "0.8 ATR",
-  day_trading: "1.2 ATR",
-  swing: "1.8 ATR",
-};
-
-const MODE_LABEL: Record<TradingMode, string> = {
-  scalping: "scalping (horizon quelques minutes, risque serré)",
-  day_trading: "day trading (horizon intraday)",
-  swing: "swing (horizon plusieurs jours)",
+/** Unité de temps de référence selon l'horizon du trade. */
+const REFERENCE_TIMEFRAME: Record<TradingMode, Timeframe> = {
+  scalping: "15m",
+  day_trading: "1h",
+  swing: "1d",
 };
 
 export class AiGatewayError extends Error {
@@ -48,56 +36,29 @@ export class AiGatewayError extends Error {
     readonly status: number,
   ) {
     super(message);
+    this.name = "AiGatewayError";
   }
 }
 
-/** Extraction tolérante : renvoie null plutôt que de jeter, safeParse gère la suite. */
-function safeExtract(raw: string): unknown {
-  try {
-    return extractJsonObject(raw);
-  } catch {
-    return null;
+export type GeneratedSignal = {
+  signal: TradingSignal;
+  /** Id de la ligne de journal, à rattacher au signal une fois celui-ci persisté. */
+  jevCallId: string | null;
+};
+
+export async function generateAiSignal(
+  symbol: string,
+  mode: TradingMode,
+  userId: string | null = null,
+): Promise<GeneratedSignal> {
+  if (!process.env["TYPESAFE_API_KEY"]) {
+    throw new AiGatewayError("Configuration IA manquante (TYPESAFE_API_KEY).", 401);
   }
-}
-
-/** Extrait court de la réponse du modèle, pour un message d'erreur lisible. */
-function preview(raw: string): string {
-  const clean = raw.replace(/\s+/g, " ").trim();
-  if (clean.length === 0) return "(réponse vide)";
-  return clean.length > 300 ? `${clean.slice(0, 300)}…` : clean;
-}
-
-function statusOf(error: unknown): number | null {
-  const candidate = error as { statusCode?: number; status?: number; cause?: unknown };
-  if (typeof candidate?.statusCode === "number") return candidate.statusCode;
-  if (typeof candidate?.status === "number") return candidate.status;
-  if (candidate?.cause) return statusOf(candidate.cause);
-  return null;
-}
-
-function messageFor(status: number, raw: string) {
-  if (status === 402)
-    return "Crédits DeepSeek épuisés. Rechargez votre compte DeepSeek pour relancer l'analyse.";
-  if (status === 403) return "L'accès à l'API DeepSeek est refusé (clé invalide ou restreinte).";
-  if (status === 429)
-    return "Trop de requêtes IA en peu de temps. Réessayez dans quelques secondes.";
-  if (status === 401) return "Clé API DeepSeek invalide ou manquante.";
-  return raw || "L'analyse IA a échoué.";
-}
-
-export async function generateAiSignal(symbol: string, mode: TradingMode): Promise<TradingSignal> {
-  const key = process.env["DEEPSEEK_API_KEY"];
-  if (!key) throw new AiGatewayError("Configuration IA manquante (DEEPSEEK_API_KEY).", 401);
-  if (!SIGNAL_MODEL)
-    throw new AiGatewayError(
-      "Configuration IA manquante (DEEPSEEK_MODEL) : indiquez l'id exact du modèle DeepSeek à utiliser.",
-      401,
-    );
 
   const startedAt = Date.now();
 
   // 80 bougies suffisent à tout ce que calcule analyseStructure (SMA50, ATR14,
-  // swings) : 150 allongeaient la collecte sans rien changer à l'analyse.
+  // swings) : au-delà, on allonge la collecte sans rien changer à l'analyse.
   const [quotes, depth, ...candleSets] = await Promise.all([
     fetchQuotes([symbol]),
     fetchDepth(symbol).catch(() => null),
@@ -111,169 +72,48 @@ export async function generateAiSignal(symbol: string, mode: TradingMode): Promi
   const analyses: StructureAnalysis[] = TIMEFRAMES.map((tf, i) =>
     analyseStructure(tf as Timeframe, candleSets[i]!),
   );
-  const reference = analyses.find(
-    (a) => a.timeframe === (mode === "swing" ? "1d" : mode === "scalping" ? "15m" : "1h"),
-  )!;
+  const reference = analyses.find((a) => a.timeframe === REFERENCE_TIMEFRAME[mode]) ?? analyses[0]!;
 
-  const gateway = createDeepSeekProvider(key);
-  const prompt = [
-    `Tu es un analyste de marché senior spécialisé ICT / Smart Money Concepts et Order Flow.`,
-    `Analyse ${symbol} pour un trade en ${MODE_LABEL[mode]}.`,
-    `Prix actuel : ${quote.price} (variation 24h : ${quote.change_24h}%).`,
-    `ATR de référence (${reference.timeframe}) : ${reference.atr}.`,
-    ``,
-    `Structure multi-timeframe calculée sur les vraies bougies :`,
-    ...analyses.map(
-      (a) =>
-        `- ${a.timeframe} : tendance ${a.trend}, ${a.structure}. Niveaux clés ${a.key_levels.join(" / ")}, POI ${a.poi_levels.join(" / ")}, FVG ${
-          a.fvg_zones.map((z) => `${z.start}-${z.end} (${z.type})`).join(", ") || "aucun"
-        }.`,
-    ),
-    depth?.source === "binance"
-      ? `Carnet d'ordres réel (Binance/OKX, 100 niveaux) : imbalance ${depth.imbalance}% (positif = pression acheteuse).`
-      : depth
-        ? `Pas de carnet d'ordres sur cet instrument : proxy volumétrique calculé sur 40 bougies 15m, imbalance ${depth.imbalance}%. Ce n'est PAS de l'order flow réel — n'en fais pas un argument fort et pondère la confiance en conséquence.`
-        : `Carnet d'ordres indisponible.`,
-    ``,
-    `Donne un signal exploitable : entrée réaliste proche du prix actuel, stop loss placé derrière un niveau invalidant la structure, et 3 take profits croissants en R:R (au moins 1.2R, 2R, 3R).`,
-    `Le stop et les TP doivent être cohérents avec la direction (pour un BUY : stop < entrée < TP1 < TP2 < TP3).`,
-    `Si aucune configuration n'est valable, renvoie direction NEUTRAL avec une confiance faible.`,
-    ``,
-    // Le schéma est décrit ici en toutes lettres : sans Output.object(), le
-    // SDK n'injecte plus de description de schéma, c'est ce bloc qui porte
-    // le contrat. Les textes sont volontairement courts : chaque phrase
-    // générée en plus, c'est de la latence en plus pour l'utilisateur.
-    `Va droit au but, sans raisonnement affiché. Réponds UNIQUEMENT par un objet JSON, sans texte autour, sans balise markdown, avec exactement ces clés :`,
-    `{`,
-    `  "direction": "BUY" | "SELL" | "NEUTRAL",`,
-    `  "entry_price": nombre,`,
-    `  "stop_loss": nombre,`,
-    `  "take_profit_1": nombre,`,
-    `  "take_profit_2": nombre,`,
-    `  "take_profit_3": nombre,`,
-    `  "confidence_score": entier 0-100,`,
-    `  "reasoning": "2 phrases maximum, en français",`,
-    `  "position_advice": "1 phrase, en français",`,
-    `  "market_warning": "1 phrase, en français" ou null,`,
-    `  "order_flow_confirms": true | false,`,
-    `  "order_flow_strength": "fort" | "moyen" | "faible",`,
-    `  "order_flow_observation": "1 phrase, en français"`,
-    `}`,
-  ].join("\n");
+  const state = buildSignalState(symbol, mode, quote, analyses, reference, depth);
+  const questions = signalQuestions(symbol, mode);
 
-  // Pas d'Output.object() : la négociation de sortie structurée du SDK avec
-  // DeepSeek a échoué de trois façons successives en production (json_schema
-  // refusé, puis json_object exigeant le mot "json", puis parsing impossible).
-  // deepseek-v4-pro tourne en mode "thinking" par défaut et entoure son JSON
-  // de raisonnement, ce qu'aucun parseur strict n'accepte. On récupère donc le
-  // texte brut et on extrait/valide nous-mêmes.
-  const llmStartedAt = Date.now();
-  let raw: string;
+  const jevStartedAt = Date.now();
+  let response;
   try {
-    const result = await generateText({
-      model: gateway(SIGNAL_MODEL),
-      prompt,
-      // En mode thinking, les tokens de raisonnement se consomment sur ce même
-      // budget : une limite trop basse (700 a été essayé) épuise le budget en
-      // raisonnement et renvoie un contenu VIDE, sans erreur. D'où une marge
-      // large ici — c'est le mode thinking qu'il faut couper pour gagner du
-      // temps, pas le budget de sortie.
-      maxOutputTokens: SIGNAL_MAX_TOKENS,
-      // Plafond dur : au-delà, mieux vaut une erreur nette qu'un utilisateur
-      // qui regarde un bouton tourner pendant plusieurs minutes.
-      abortSignal: AbortSignal.timeout(SIGNAL_TIMEOUT_MS),
-    });
-    // Les modèles à raisonnement peuvent placer leur sortie dans le champ de
-    // raisonnement et laisser le contenu vide : on regarde les deux.
-    raw = result.text?.trim() ? result.text : (result.reasoningText ?? "");
+    response = await systemOne({ state, questions });
   } catch (error) {
-    const elapsed = Math.round((Date.now() - llmStartedAt) / 1000);
-    if (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")) {
-      console.error(`[DeepSeek] délai dépassé après ${elapsed}s (modèle ${SIGNAL_MODEL})`);
-      throw new AiGatewayError(
-        `Le modèle ${SIGNAL_MODEL} n'a pas répondu en moins de ${Math.round(SIGNAL_TIMEOUT_MS / 1000)}s. Réessayez, ou passez sur un modèle plus rapide.`,
-        504,
+    if (error instanceof JevError) {
+      console.error(
+        `[Jev] échec HTTP ${error.status}${error.requestId ? ` (request_id=${error.requestId})` : ""} — ${error.message}`,
       );
+      throw new AiGatewayError(error.message, error.status);
     }
-    const status = statusOf(error) ?? 500;
-    throw new AiGatewayError(messageFor(status, (error as Error).message), status);
+    throw new AiGatewayError(`L'analyse a échoué : ${(error as Error).message}`, 500);
   }
-  const llmMs = Date.now() - llmStartedAt;
+  const jevMs = Date.now() - jevStartedAt;
+
+  const decision = decide(response);
+  const signal = buildSignal({ symbol, mode, quote, analyses, reference, depth, decision });
+
+  const totalMs = Date.now() - startedAt;
   console.log(
-    `[Smartrade] ${symbol} ${mode} — marché ${marketMs}ms, modèle ${llmMs}ms (${SIGNAL_MODEL}), total ${Date.now() - startedAt}ms`,
+    `[Smartrade] ${symbol} ${mode} — marché ${marketMs}ms, Jev ${jevMs}ms (${response.model}), ` +
+      `total ${totalMs}ms → ${decision.direction} ${signal.confidence_score}%` +
+      (decision.vetoReason ? ` (veto: ${decision.vetoReason})` : ""),
   );
 
-  const parsed = AiSignal.safeParse(safeExtract(raw));
-  if (!parsed.success) {
-    console.error("[DeepSeek] réponse non conforme. Texte brut:", raw);
-    console.error("[DeepSeek] erreurs de validation:", parsed.error.issues);
-    // L'extrait est renvoyé au client : sans accès aux logs du Worker, c'est
-    // le seul moyen de diagnostiquer un échec depuis l'interface.
-    throw new AiGatewayError(
-      `L'IA n'a pas renvoyé une analyse exploitable. Réponse reçue : ${preview(raw)}`,
-      502,
-    );
-  }
-  const output = parsed.data;
-
-  const ref = quote.price;
-
-  // The model is asked for coherent levels but nothing guarantees them: an
-  // inverted stop or an unreachable entry must never reach a user's platform.
-  const checked = checkLevels(
-    {
-      entry_price: output.entry_price,
-      stop_loss: output.stop_loss,
-      take_profit_1: output.take_profit_1,
-      take_profit_2: output.take_profit_2,
-      take_profit_3: output.take_profit_3,
-    },
-    output.direction,
-    ref,
-    reference.atr,
-    mode,
-  );
-  const warning = checked.corrected
-    ? `Niveaux recalculés automatiquement (${checked.reason}) : entrée au prix courant, stop à ${SL_ATR_LABEL[mode]} et take profits en 1.2R / 2R / 3R.${
-        output.market_warning ? ` ${output.market_warning}` : ""
-      }`
-    : output.market_warning;
-  const confidence = Math.max(0, Math.min(100, Math.round(output.confidence_score)));
-
-  return {
-    id: `sig-${symbol}-${Date.now()}`,
+  const jevCallId = await logJevCall({
+    userId,
     symbol,
-    direction: output.direction,
-    entry_price: roundTo(checked.levels.entry_price, ref),
-    stop_loss: roundTo(checked.levels.stop_loss, ref),
-    take_profit_1: roundTo(checked.levels.take_profit_1, ref),
-    take_profit_2: roundTo(checked.levels.take_profit_2, ref),
-    take_profit_3: roundTo(checked.levels.take_profit_3, ref),
-    // A rebuilt setup is not the setup the model scored: cap the confidence.
-    confidence_score: checked.corrected ? Math.min(confidence, 55) : confidence,
-    trading_mode: mode,
-    strategy: "ict_smc",
-    timeframe_analysis: analyses.map((a) => ({
-      timeframe: a.timeframe,
-      trend: a.trend,
-      structure: a.structure,
-      key_levels: a.key_levels,
-      fvg_zones: a.fvg_zones,
-      bos_detected: a.bos_detected,
-      poi_levels: a.poi_levels,
-    })),
-    reasoning: output.reasoning,
-    position_advice: output.position_advice,
-    market_warning: warning,
-    order_flow_confirmation: {
-      confirms_direction: output.order_flow_confirms,
-      strength: output.order_flow_strength,
-      key_observation: output.order_flow_observation,
-    },
-    status: "active",
-    pnl_percent: null,
-    closed_at: null,
-    closed_price: null,
-    created_at: new Date().toISOString(),
-  };
+    mode,
+    model: response.model || JEV_MODEL,
+    state,
+    questions,
+    response,
+    decision,
+    signal,
+    latencyMs: jevMs,
+  });
+
+  return { signal, jevCallId };
 }

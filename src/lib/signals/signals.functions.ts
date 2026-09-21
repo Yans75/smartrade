@@ -58,8 +58,9 @@ export const generateSignal = createServerFn({ method: "POST" })
 
     const { generateAiSignal, AiGatewayError } = await import("./signals.server");
     let signal;
+    let jevCallId: string | null = null;
     try {
-      signal = await generateAiSignal(data.symbol, data.mode);
+      ({ signal, jevCallId } = await generateAiSignal(data.symbol, data.mode, userId));
     } catch (error) {
       const status = error instanceof AiGatewayError ? error.status : 500;
       return {
@@ -92,6 +93,13 @@ export const generateSignal = createServerFn({ method: "POST" })
       })
       .select(SIGNAL_COLUMNS)
       .maybeSingle();
+
+    // Rattache la décision de Jev au signal réellement servi : sans ce lien, le
+    // journal ne permet pas de confronter une décision à son résultat.
+    if (jevCallId && inserted) {
+      const { linkJevCallToSignal } = await import("./jev-log.server");
+      await linkJevCallToSignal(jevCallId, (inserted as { id: string }).id);
+    }
 
     await supabase
       .from("signal_usage")

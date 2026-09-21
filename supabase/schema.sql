@@ -177,6 +177,64 @@ DROP POLICY IF EXISTS "Users can update their own usage" ON public.signal_usage;
 CREATE POLICY "Users can update their own usage" ON public.signal_usage
   FOR UPDATE TO authenticated USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
 
+-- ------------------------------------------- journal des appels au moteur Jev --
+-- Chaque décision de Jev est archivée avec l'état exact qui lui a été soumis et
+-- les questions exactes qui lui ont été posées. C'est ce qui rend la
+-- calibration possible : sans l'état d'origine, un backtest ne peut pas
+-- rejouer la décision, et sans les questions, une reformulation ultérieure
+-- rendrait les anciennes réponses incomparables.
+
+CREATE TABLE IF NOT EXISTS public.jev_calls (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+  signal_id UUID REFERENCES public.signals(id) ON DELETE SET NULL,
+  symbol TEXT NOT NULL,
+  trading_mode TEXT NOT NULL,
+  model TEXT NOT NULL,
+
+  -- Entrées exactes de l'appel, pour rejouabilité.
+  state JSONB NOT NULL,
+  questions JSONB NOT NULL,
+
+  -- Sorties brutes, puis décision après garde-fous.
+  answers JSONB NOT NULL,
+  direction TEXT NOT NULL,
+  direction_probability NUMERIC,
+  setup_quality NUMERIC,
+  setup_confidence NUMERIC,
+  entry_timing TEXT,
+  veto_reason TEXT,
+  confidence_score INTEGER,
+
+  -- Niveaux servis, dupliqués ici pour analyser sans jointure.
+  entry_price NUMERIC,
+  stop_loss NUMERIC,
+  take_profit_1 NUMERIC,
+
+  -- Exploitation et coût.
+  latency_ms INTEGER,
+  input_tokens INTEGER,
+  output_tokens INTEGER,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS jev_calls_created_idx ON public.jev_calls (created_at DESC);
+CREATE INDEX IF NOT EXISTS jev_calls_symbol_idx ON public.jev_calls (symbol, trading_mode, created_at DESC);
+CREATE INDEX IF NOT EXISTS jev_calls_signal_idx ON public.jev_calls (signal_id);
+
+-- Écriture réservée au serveur : un client ne doit jamais pouvoir fabriquer
+-- une ligne de calibration. Lecture limitée à ses propres appels.
+GRANT SELECT ON public.jev_calls TO authenticated;
+GRANT ALL ON public.jev_calls TO service_role;
+ALTER TABLE public.jev_calls ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Users can view their own Jev calls" ON public.jev_calls;
+CREATE POLICY "Users can view their own Jev calls" ON public.jev_calls
+  FOR SELECT TO authenticated USING (
+    auth.uid() = user_id
+    OR EXISTS (SELECT 1 FROM public.user_roles ur WHERE ur.user_id = auth.uid() AND ur.role = 'admin')
+  );
+
 -- ------------------------------------------------------------- durcissement --
 -- Aucune de ces fonctions ne doit être appelable depuis le navigateur.
 

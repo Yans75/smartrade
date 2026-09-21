@@ -74,7 +74,7 @@ function Landing() {
         <section className="mx-auto grid max-w-6xl items-center gap-10 py-16 lg:grid-cols-2 lg:py-24">
           <div>
             <span className="inline-flex items-center gap-2 rounded-full bg-muted px-3 py-1.5 font-mono text-[10px] tracking-widest uppercase text-brand-text">
-              <Sparkles className="h-3 w-3" /> DeepSeek · ICT/SMC · Order Flow
+              <Sparkles className="h-3 w-3" /> Jev · ICT/SMC · Order Flow
             </span>
             <h1 className="mt-6 font-display text-4xl font-black tracking-tight sm:text-5xl lg:text-6xl">
               Signaux de trading IA —{" "}

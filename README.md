@@ -3,9 +3,12 @@
 Plateforme SaaS de signaux de trading, indépendante — pas de plateforme
 tierce, pas de fournisseur imposé. L'application lit la structure de marché
 (ICT / Smart Money Concepts) sur quatre unités de temps à partir de vraies
-bougies, y ajoute le carnet d'ordres quand il existe, puis demande à un LLM de
-transformer cette lecture en signal exploitable : direction, entrée, stop
-loss, trois take profits et le raisonnement en français.
+bougies, y ajoute le carnet d'ordres quand il existe, puis soumet cette
+lecture au moteur de décision Jev (TypeSafe AI). Jev tranche — sens, qualité
+du setup, moment d'entrée — et le code calcule les niveaux depuis l'ATR :
+entrée, stop loss, trois take profits.
+
+Le modèle ne manipule aucun prix, donc il ne peut en inventer aucun.
 
 Marchés couverts : crypto, forex, matières premières, indices — 36
 instruments. Modèle économique : 3 signaux offerts par jour, abonnement Pro à
@@ -21,7 +24,7 @@ instruments. Modèle économique : 3 signaux offerts par jour, abonnement Pro à
 | Routage | TanStack Router (routes fichiers dans `src/routes`) |
 | UI | Tailwind CSS v4, shadcn/ui, Recharts, Lucide |
 | Données & auth | Supabase — votre propre projet, RLS par utilisateur |
-| Appel LLM | Vercel AI SDK (`@ai-sdk/openai-compatible`) directement vers l'API DeepSeek |
+| Moteur de décision | TypeSafe AI (Jev), client REST maison — aucun SDK |
 | Données de marché | Binance → OKX → Bybit (crypto), Yahoo Finance et Twelve Data (reste), gold-api (spot métaux) |
 | Runtime | Bun |
 | Déploiement cible | Cloudflare Workers (build Nitro déjà configuré, preset `cloudflare-module`) |
@@ -53,41 +56,84 @@ Calcul déterministe, en TypeScript, sur chaque unité de temps : pivots
 hauts/bas, Break of Structure, tendance (BOS + SMA20 vs SMA50), Fair Value
 Gaps (imbalance à trois bougies), ATR 14, niveaux clés.
 
-**4. Appel au LLM** — `src/lib/signals/signals.server.ts`
-Le modèle ne voit pas les bougies : il reçoit le résumé structurel des
-quatre unités de temps, le prix, l'ATR de référence et l'imbalance du
-carnet. Il rend un objet validé par un schéma Zod. Le calcul est
-algorithmique, le LLM fait l'interprétation, le placement des niveaux et la
-rédaction.
+**4. Décision par le moteur Jev** — `src/lib/signals/signals.server.ts`
+Le modèle ne voit pas les bougies : `jev-state.ts` lui soumet un état
+structuré — prix, ATR, structure des quatre unités de temps, distance de
+chaque FVG en ATR, imbalance du carnet. L'état ne contient que des mesures,
+jamais de conclusion : souffler la réponse au modèle rendrait ses
+probabilités inexploitables pour la calibration.
 
-**5. Garde-fou déterministe** — `src/lib/signals/validate.ts`
-La sortie du modèle est revalidée avant d'atteindre l'utilisateur. Un jeu de
-niveaux est rejeté quand l'entrée est à plus de 1,5 ATR du prix courant,
-quand l'ordre entrée/stop/take profits est incohérent avec la direction,
-quand la distance de stop sort de la fourchette 0,25–4 ATR, ou quand le TP1
-n'offre même pas 1R. Dans ce cas les niveaux sont reconstruits sur l'ATR
-(stop à 0,8 / 1,2 / 1,8 ATR selon l'horizon, take profits en 1,2R / 2R / 3R),
-la confiance est plafonnée à 55 et l'utilisateur est prévenu dans
-`market_warning`.
+`jev-questions.ts` pose trois questions typées en un seul appel :
+
+| Question | Type | Réponse |
+|---|---|---|
+| `direction` | choice | BUY / SELL / NEUTRAL + probabilité de chacun |
+| `setup_quality` | score | note 0–4 sur un barème explicite + confiance |
+| `entry_timing` | choice | immediate / pullback / wait |
+
+**5. Construction du signal** — `src/lib/signals/build-signal.ts`
+Jev décide, le code calcule. Aucun prix ne transite par le modèle, donc
+aucun prix ne peut être halluciné — c'est l'inverse de l'approche LLM
+génératif, où chaque niveau sortait du texte et devait être rattrapé après
+coup.
+
+Garde-fous appliqués à la sortie de Jev :
+
+- qualité de setup sous 1,5/4 → `NEUTRAL` forcé ;
+- sens retenu sous 45 % de probabilité → `NEUTRAL` (c'est un pile ou face) ;
+- `entry_timing = wait` → `NEUTRAL` ;
+- `pullback` → l'entrée se pose sur le bord du FVG le plus proche allant
+  dans le sens du trade, entre 0,2 et 1,5 ATR ; sans candidat, entrée au
+  prix courant plutôt qu'à un niveau que le marché n'atteindra pas.
+
+Les niveaux viennent de `validate.ts` (`buildLevels`) : stop à 0,8 / 1,2 /
+1,8 ATR selon l'horizon, take profits en 1,2R / 2R / 3R. `checkLevels` reste
+en filet pour les ATR dégénérés sur instruments peu liquides. La confiance
+affichée est `probabilité du sens × (0,5 + 0,5 × qualité/4)`.
+
+**6. Journalisation** — `src/lib/signals/jev-log.server.ts`
+Chaque appel est archivé dans `jev_calls` avec l'état exact soumis, les
+questions exactes posées, les réponses brutes, la décision après garde-fous,
+la latence et les tokens. Sans l'état d'origine un backtest ne peut pas
+rejouer la décision ; sans les questions d'origine, une reformulation
+ultérieure rendrait les anciennes réponses incomparables. Une écriture de
+journal ne peut jamais faire échouer une génération : toute erreur est avalée
+et tracée.
 
 Le signal est ensuite écrit dans `signals` et le quota incrémenté.
 
-### Le fournisseur IA : DeepSeek
+### Le moteur de décision : Jev (TypeSafe AI)
 
-`src/lib/ai-gateway.server.ts` appelle l'API DeepSeek directement (elle est
-compatible OpenAI, d'où le même client `@ai-sdk/openai-compatible` déjà
-utilisé). Base URL confirmée depuis la page officielle *Models & Pricing* de
-DeepSeek : `https://api.deepseek.com` (sans `/v1` — le client n'ajoute que
-`/chat/completions`).
+`src/lib/jev/client.server.ts` appelle `POST https://api.typesafe.ai/v1/systemone`.
 
-- `DEEPSEEK_API_KEY` — votre clé, depuis platform.deepseek.com
-- `DEEPSEEK_MODEL` — id du modèle. Défaut : `deepseek-v4-pro` (id confirmé
-  sur la page *Models & Pricing* de DeepSeek — support JSON Output et Tool
-  Calls vérifié, ce dont dépend la sortie structurée du signal). Modifiable
-  pour tester une autre variante, par exemple `deepseek-v4-flash`.
+TypeSafe publie un SDK Python ; il est inutilisable ici, un Cloudflare Worker
+étant un isolat V8 qui n'exécute pas de Python. Le client est donc une
+réimplémentation TypeScript du même contrat REST sur `fetch`, écrite d'après
+le schéma OpenAPI publié par l'API (`https://api.typesafe.ai/openapi.json`)
+tel que le reflète le SDK 0.7.0.
 
-Sans `DEEPSEEK_API_KEY`, la génération de signal échoue avec un message
-explicite plutôt que d'appeler l'API sans authentification.
+Jev est un modèle *System One* : il ne déroule aucune chaîne de raisonnement
+et renvoie des probabilités calibrées plutôt que du texte. C'est ce qui rend
+le budget de latence tenable — et ce qui garantit qu'il ne peut pas inventer
+un niveau de prix.
+
+Variables d'environnement (seule la première est obligatoire) :
+
+| Variable | Défaut | Rôle |
+|---|---|---|
+| `TYPESAFE_API_KEY` | — | clé API, depuis typesafe.ai |
+| `TYPESAFE_MODEL` | `jev-latest` | alias du modèle ; `GET /v1/models` liste les valides |
+| `TYPESAFE_TIMEOUT_MS` | `8000` | plafond par tentative |
+| `TYPESAFE_MAX_RETRIES` | `1` | nouvelles tentatives sur 408 / 429 / 5xx |
+| `TYPESAFE_BASE_URL` | `https://api.typesafe.ai` | à ne changer que pour un mock |
+
+Les erreurs non réessayables (401, 403, 404, 422) remontent immédiatement,
+traduites en français et sans nouvelle tentative. `listModels()` sert de test
+de bout en bout : c'est l'appel le moins cher qui prouve à la fois que la clé
+est valide et que l'alias configuré existe.
+
+Sans `TYPESAFE_API_KEY`, la génération échoue avec un message explicite
+plutôt que d'appeler l'API sans authentification.
 
 ---
 
@@ -121,8 +167,8 @@ En crypto, le carnet est réel : 100 niveaux Binance ou OKX, agrégés en 14
 paliers cumulés. Sur le forex, les matières premières et les indices, il
 n'existe pas de carnet public : la courbe affichée est un proxy reconstruit
 à partir de la distribution des volumes des 40 dernières bougies 15m,
-étiqueté « estimé » dans l'interface et signalé comme tel dans le prompt
-envoyé au modèle.
+étiqueté « estimé » dans l'interface, et l'état soumis à Jev porte un champ
+`fiabilite` explicite pour qu'il n'en fasse pas un argument fort.
 
 ---
 
@@ -133,12 +179,16 @@ src/
 ├── routes/                 # pages (TanStack Router)
 ├── components/             # UI : SignalCard, DepthChart, TimeframePanel…
 ├── lib/
-│   ├── ai-gateway.server.ts    # client DeepSeek
+│   ├── jev/client.server.ts    # client TypeSafe AI (REST, sans SDK)
 │   ├── market/                 # sources de marché, symboles, cache
 │   ├── signals/
 │   │   ├── analysis.server.ts  # ICT/SMC déterministe
-│   │   ├── signals.server.ts   # prompt + appel LLM
-│   │   ├── validate.ts         # garde-fou sur les niveaux
+│   │   ├── signals.server.ts   # orchestration du pipeline
+│   │   ├── jev-state.ts        # état de marché soumis à Jev
+│   │   ├── jev-questions.ts    # les 3 questions de décision
+│   │   ├── build-signal.ts     # décision → signal, niveaux sur ATR
+│   │   ├── jev-log.server.ts   # journal des appels (backtest, calibration)
+│   │   ├── validate.ts         # géométrie des niveaux + garde-fou
 │   │   ├── tracking.server.ts  # résolution TP / SL
 │   │   ├── signals.functions.ts# server functions (quota, persistance, sync)
 │   │   ├── derive.ts           # statistiques détaillées
@@ -177,7 +227,7 @@ droits admin et déploiement, avec les pièges courants.
 En résumé :
 
 ```bash
-cp .env.example .env    # puis remplir les clés Supabase + DeepSeek
+cp .env.example .env    # puis remplir les clés Supabase + TypeSafe
 bun install
 bun run dev             # http://localhost:8080
 bun run lint
@@ -197,7 +247,7 @@ avec les mêmes variables d'environnement côté Worker.
 ## Reste à faire
 
 - Paiement Stripe (bouton Pro en démo)
-- Confirmer l'id de modèle DeepSeek exact et valider le format de sortie
+- Calibrer les seuils de décision sur les premières lignes de `jev_calls`
   structuré (`Output.object`) contre l'API réelle
 - Notifications Telegram et email
 - Basculer la synchronisation des positions en tâche de fond planifiée

@@ -32,6 +32,24 @@ function riskUnit(atr: number, price: number) {
   return finite(atr) && atr > price * 0.0001 ? atr : price * 0.004;
 }
 
+/**
+ * Construit les niveaux depuis une entrée, l'ATR et l'horizon.
+ *
+ * Seule source de vérité pour la géométrie stop / take profits : le moteur de
+ * décision (build-signal.ts) l'appelle pour produire les niveaux, et
+ * checkLevels le rappelle comme filet. Deux formules divergentes donneraient
+ * des signaux dont le R:R affiché ne correspondrait pas au R:R réel.
+ */
+export function buildLevels(
+  direction: "BUY" | "SELL",
+  entry: number,
+  atr: number,
+  price: number,
+  mode: TradingMode,
+): Levels {
+  return rebuild(direction, entry, riskUnit(atr, price), mode);
+}
+
 function rebuild(
   direction: "BUY" | "SELL",
   entry: number,

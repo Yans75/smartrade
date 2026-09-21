@@ -49,8 +49,9 @@ Elle ne sert qu'à l'espace admin.
 cp .env.example .env
 ```
 
-Puis renseignez les 5 variables Supabase ci-dessus. `DEEPSEEK_API_KEY` et
-`DEEPSEEK_MODEL` sont déjà documentées dans le même fichier.
+Puis renseignez les 5 variables Supabase ci-dessus. `TYPESAFE_API_KEY` est la
+seule autre variable obligatoire ; les autres `TYPESAFE_*` ont un défaut sain
+et sont documentées dans le même fichier.
 
 `.env` est gitignoré : vos clés ne partiront jamais sur GitHub.
 
@@ -121,5 +122,6 @@ l'URL de production dans la configuration d'authentification Supabase
 | Inscription sans redirection vers le dashboard | *Confirm email* actif (étape 5) |
 | Retour de connexion Google sur une mauvaise URL | *Redirect URLs* non configurées (étape 5) |
 | `/admin` refuse l'accès | Rôle admin non attribué (étape 7), ou session pas rechargée |
-| `Clé API DeepSeek invalide ou manquante` | `DEEPSEEK_API_KEY` absente de `.env` |
+| `Clé API TypeSafe invalide ou manquante` | `TYPESAFE_API_KEY` absente de `.env` |
+| `Modèle Jev introuvable` | `TYPESAFE_MODEL` pointe un alias inexistant — laissez-le vide pour `jev-latest` |
 | Signaux générés mais aucune stat | Normal tant qu'aucune position n'est clôturée : le win rate ne compte que les trades résolus (TP/SL atteint ou expiration) |
